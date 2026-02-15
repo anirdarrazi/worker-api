@@ -296,4 +296,68 @@ app.post("/internal/usage-report", async (c) => {
   return c.json({ ok: true });
 });
 
+// --------------- New admin endpoints -----------------
+// List/filter jobs by status, model_id, user_id, node_id with pagination
+app.get("/internal/jobs", async (c) => {
+  const url = new URL(c.req.url);
+  const status = url.searchParams.get("status") || undefined;
+  const modelId = url.searchParams.get("model_id") || undefined;
+  const userId = url.searchParams.get("user_id") || undefined;
+  const nodeId = url.searchParams.get("node_id") || undefined;
+  const limit = Number(url.searchParams.get("limit") || "50");
+  const offset = Number(url.searchParams.get("offset") || "0");
+  const filters: string[] = [];
+  const binds: any[] = [];
+  if (status) {
+    filters.push("status = ?");
+    binds.push(status);
+  }
+  if (modelId) {
+    filters.push("model_id = ?");
+    binds.push(modelId);
+  }
+  if (userId) {
+    filters.push("user_id = ?");
+    binds.push(userId);
+  }
+  if (nodeId) {
+    filters.push("node_id = ?");
+    binds.push(nodeId);
+  }
+  const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  // Build query with ordering and pagination
+  const sql = `SELECT id, user_id, api_key_id, model_id, node_id, status, created_at, finished_at, prompt_tokens, completion_tokens, cost_nano_usd, error FROM jobs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+  binds.push(limit, offset);
+  const result = await c.env.DB.prepare(sql).bind(...binds).all<any>();
+  return c.json({ jobs: result.results });
+});
+
+// Cancel a running job by id
+app.post("/internal/jobs/cancel", async (c) => {
+  const body = await c.req.json<{ job_id?: string }>();
+  const jobId = body?.job_id;
+  if (!jobId) return jsonError(400, "invalid_request_error", "job_id required");
+  // fetch job record
+  const job = await c.env.DB.prepare(`SELECT id, node_id, status FROM jobs WHERE id = ? LIMIT 1`).bind(jobId).first<any>();
+  if (!job) return jsonError(404, "job_not_found", "Job not found");
+  if (job.status !== "running") {
+    // mark as cancelled if already finished or not running
+    await c.env.DB.prepare(`UPDATE jobs SET status = 'cancelled', finished_at = ? WHERE id = ?`).bind(nowSec(), jobId).run();
+    return c.json({ ok: true, status: "cancelled" });
+  }
+  // send cancel to node via DO
+  const stub = c.env.NODE_BROKER.getByName(job.node_id);
+  await stub.fetch("https://do/cancel", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-radiance-internal-token": c.env.INTERNAL_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ rid: jobId }),
+  });
+  // mark job as cancelled in DB
+  await c.env.DB.prepare(`UPDATE jobs SET status = 'cancelled', finished_at = ? WHERE id = ?`).bind(nowSec(), jobId).run();
+  return c.json({ ok: true, status: "cancelled" });
+});
+
 export default app;

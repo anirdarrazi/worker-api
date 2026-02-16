@@ -1,3 +1,5 @@
+export { NodeBroker } from "./node_broker";
+
 import { Hono } from "hono";
 import { z } from "zod";
 
@@ -52,6 +54,18 @@ async function hmacSign(secret: string, msg: string): Promise<string> {
   return btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
 }
 
+/**
+ * Get a NodeBroker DO stub for a node id/name.
+ * - Your existing code uses getByName(), but Cloudflare’s standard API is idFromName()+get().
+ * - This helper supports both.
+ */
+function getNodeBrokerStub(env: Env, nodeId: string) {
+  const ns: any = env.NODE_BROKER as any;
+  if (typeof ns.getByName === "function") return ns.getByName(nodeId);
+  const id = env.NODE_BROKER.idFromName(nodeId);
+  return env.NODE_BROKER.get(id);
+}
+
 /** Middleware: assign a request ID */
 app.use("*", async (c, next) => {
   c.set("requestId", uuid());
@@ -95,6 +109,30 @@ app.use("/v1/*", async (c, next) => {
   if (!success) return jsonError(429, "rate_limit_exceeded", "Rate limit exceeded");
 
   await next();
+});
+
+/**
+ * PUBLIC Node websocket endpoint (Worker → Durable Object → node).
+ *
+ * Your Durable Object expects `GET /connect` (Upgrade: websocket),
+ * but DOs are NOT automatically exposed as public HTTP routes.
+ *
+ * This route forwards the incoming websocket upgrade request to the DO’s internal `/connect`.
+ */
+app.get("/do/nodebroker/connect", async (c) => {
+  const nodeId = c.req.header("x-radiance-node-id") || "";
+  if (!nodeId) return c.text("Missing x-radiance-node-id", 400);
+
+  const stub = getNodeBrokerStub(c.env, nodeId);
+
+  // Preserve query params (ts/nonce/sig) for DO handshake verification
+  const url = new URL(c.req.url);
+  const target = "https://do/connect" + url.search;
+
+  // IMPORTANT: rewrite the URL to `/connect` so node_broker.ts matches `url.pathname === "/connect"`
+  const req = new Request(target, c.req.raw);
+
+  return stub.fetch(req);
 });
 
 /** Health endpoint */
@@ -142,7 +180,7 @@ app.get("/openrouter/models", async (c) => {
 // ---------- Durable Object invocation helper ----------
 async function invokeViaDO(c: any, nodeId: string, path: string, body: any, headers: Record<string, string>) {
   // get stub for node's durable object
-  const stub = c.env.NODE_BROKER.getByName(nodeId);
+  const stub = getNodeBrokerStub(c.env, nodeId);
   const payload = {
     __path: path,
     __headers: headers,
@@ -174,7 +212,9 @@ async function pickNode(env: Env, modelId: string) {
 // Check wallet for prepaid plan (skip for provider)
 async function prepaidCheck(env: Env, auth: AuthCtx) {
   if (auth.plan === "provider") return true;
-  const wallet = await env.DB.prepare(`SELECT balance_nano_usd FROM wallets WHERE user_id = ? LIMIT 1`).bind(auth.userId).first<{ balance_nano_usd: number }>();
+  const wallet = await env.DB.prepare(`SELECT balance_nano_usd FROM wallets WHERE user_id = ? LIMIT 1`)
+    .bind(auth.userId)
+    .first<{ balance_nano_usd: number }>();
   return wallet ? wallet.balance_nano_usd > -1_000_000_000 : false;
 }
 
@@ -276,11 +316,28 @@ app.post("/internal/usage-report", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE jobs SET status = ?, finished_at = ?, prompt_tokens = ?, completion_tokens = ?, cost_nano_usd = ?, error = ? WHERE id = ?`
-    ).bind(report.status, finishedAt, report.prompt_tokens, report.completion_tokens, costNano.toString(), report.error ?? null, report.job_id),
+    ).bind(
+      report.status,
+      finishedAt,
+      report.prompt_tokens,
+      report.completion_tokens,
+      costNano.toString(),
+      report.error ?? null,
+      report.job_id
+    ),
     c.env.DB.prepare(
       `INSERT INTO usage_ledger (id, job_id, user_id, model_id, prompt_tokens, completion_tokens, cost_nano_usd, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(uuid(), report.job_id, report.user_id, report.model_id, report.prompt_tokens, report.completion_tokens, costNano.toString(), finishedAt),
+    ).bind(
+      uuid(),
+      report.job_id,
+      report.user_id,
+      report.model_id,
+      report.prompt_tokens,
+      report.completion_tokens,
+      costNano.toString(),
+      finishedAt
+    ),
     c.env.DB.prepare(
       `UPDATE wallets SET balance_nano_usd = balance_nano_usd - ?, updated_at = ? WHERE user_id = ?`
     ).bind(costNano.toString(), finishedAt, report.user_id),
@@ -289,7 +346,13 @@ app.post("/internal/usage-report", async (c) => {
   // log to analytics
   c.env.AE.writeDataPoint({
     blobs: [report.user_id, report.model_id, report.status],
-    doubles: [report.prompt_tokens, report.completion_tokens, Number(costNano) / 1e9, report.ttft_ms ?? 0, report.tokens_per_sec ?? 0],
+    doubles: [
+      report.prompt_tokens,
+      report.completion_tokens,
+      Number(costNano) / 1e9,
+      report.ttft_ms ?? 0,
+      report.tokens_per_sec ?? 0
+    ],
     indexes: [report.user_id],
   });
 
@@ -326,7 +389,9 @@ app.get("/internal/jobs", async (c) => {
   }
   const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
   // Build query with ordering and pagination
-  const sql = `SELECT id, user_id, api_key_id, model_id, node_id, status, created_at, finished_at, prompt_tokens, completion_tokens, cost_nano_usd, error FROM jobs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+  const sql =
+    `SELECT id, user_id, api_key_id, model_id, node_id, status, created_at, finished_at, prompt_tokens, completion_tokens, cost_nano_usd, error ` +
+    `FROM jobs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
   binds.push(limit, offset);
   const result = await c.env.DB.prepare(sql).bind(...binds).all<any>();
   return c.json({ jobs: result.results });
@@ -346,7 +411,7 @@ app.post("/internal/jobs/cancel", async (c) => {
     return c.json({ ok: true, status: "cancelled" });
   }
   // send cancel to node via DO
-  const stub = c.env.NODE_BROKER.getByName(job.node_id);
+  const stub = getNodeBrokerStub(c.env, job.node_id);
   await stub.fetch("https://do/cancel", {
     method: "POST",
     headers: {
